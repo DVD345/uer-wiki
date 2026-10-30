@@ -1,0 +1,302 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<script type="importmap">{"imports":{"three":"./node_modules/three/build/three.module.js","three/addons/":"./node_modules/three/examples/jsm/"}}</script>
+<style>body{margin:0;background:#17191c}</style></head><body>
+<script type="module">
+import * as THREE from 'three';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {OutputPass} from 'three/addons/postprocessing/OutputPass.js';
+
+const BG = 0x17191c;
+const PXM = 236;               // пікселів на метр (для 2x)
+const COL = {y:'#ffc81a', g:'#18f07a', r:'#ff1808', w:'#eef4ff', b:'#3a5cff'};
+const OFF = {y:'#3b300f', g:'#0f3326', r:'#3d100c', w:'#3a3d42', b:'#10183f', x:'#3c220c'};
+
+const renderer = new THREE.WebGLRenderer({antialias:true, preserveDrawingBuffer:true});
+renderer.setPixelRatio(1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+/* ---------- текстури ---------- */
+function canvasTex(w, h, draw){
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 8; return t;
+}
+const texCache = {};
+function lensTex(c, lit){
+  const k = c + lit; if (texCache[k]) return texCache[k];
+  return texCache[k] = canvasTex(256, 256, (x, w) => {
+    const half = c === 'x';
+    const paint = (col, y0, y1) => {
+      x.save(); x.beginPath(); x.rect(0, y0, w, y1 - y0); x.clip();
+      const g = x.createRadialGradient(118, 120, 4, 128, 128, 128);
+      if (lit){ g.addColorStop(0, col === COL.r ? '#ffb39a' : '#ffffff'); g.addColorStop(col === COL.r ? .18 : .28, col); g.addColorStop(1, col); }
+      else { g.addColorStop(0, col); g.addColorStop(.85, '#08090a'); g.addColorStop(1, '#030303'); }
+      x.fillStyle = g; x.fillRect(0, 0, w, w); x.restore();
+    };
+    if (half){ paint(lit ? COL.y : OFF.y, 0, 128); paint(lit ? COL.r : OFF.r, 128, 256); }
+    else paint(lit ? COL[c] : OFF[c], 0, 256);
+    /* кільця лінзи Френеля */
+    x.lineWidth = 3;
+    for (let r = 18; r < 128; r += 13){ x.strokeStyle = lit ? 'rgba(255,255,255,.16)' : 'rgba(255,255,255,.07)'; x.beginPath(); x.arc(128, 128, r, 0, 7); x.stroke();
+      x.strokeStyle = 'rgba(0,0,0,.18)'; x.beginPath(); x.arc(128, 128, r + 3, 0, 7); x.stroke(); }
+  });
+}
+function haloTex(c){
+  const k = 'h' + c; if (texCache[k]) return texCache[k];
+  return texCache[k] = canvasTex(256, 256, (x, w) => {
+    const g = x.createRadialGradient(128, 128, 0, 128, 128, 128);
+    const rgb = {y:'255,190,30', g:'30,255,120', r:'255,40,20', w:'220,235,255', b:'70,100,255'}[c];
+    const a = c === 'b' ? .9 : c === 'r' ? .8 : .55;
+    g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(.22, `rgba(${rgb},${a * .55})`); g.addColorStop(.5, `rgba(${rgb},${a * .16})`); g.addColorStop(1, `rgba(${rgb},0)`);
+    x.fillStyle = g; x.fillRect(0, 0, w, w);
+  });
+}
+function plateTex(rows, w, h){
+  return canvasTex(w * 4, h * 4, (x, W, H) => {
+    x.fillStyle = '#f2f2ee'; x.fillRect(0, 0, W, H);
+    x.strokeStyle = '#111'; x.lineWidth = 10; x.strokeRect(5, 5, W - 10, H - 10);
+    x.fillStyle = '#111'; x.textAlign = 'center'; x.textBaseline = 'middle';
+    const fs = Math.min(H / rows.length * .72, W / Math.max(...rows.map(r => r.length)) * 1.15);
+    x.font = 'bold ' + fs + 'px Arial, sans-serif';
+    rows.forEach((r, i) => x.fillText(r, W / 2, H * (i + .5) / rows.length + fs * .04));
+  });
+}
+const stripeTex = canvasTex(64, 256, (x, w, h) => {
+  x.fillStyle = '#ecebe5'; x.fillRect(0, 0, w, h);
+  x.fillStyle = '#121212';
+  for (let y = -64; y < h + 64; y += 64){ x.beginPath(); x.moveTo(0, y); x.lineTo(w, y + 26); x.lineTo(w, y + 58); x.lineTo(0, y + 32); x.fill(); }
+});
+stripeTex.wrapS = stripeTex.wrapT = THREE.RepeatWrapping;
+function concreteTex(){
+  return canvasTex(128, 256, (x, w, h) => {
+    x.fillStyle = '#a3a5a2'; x.fillRect(0, 0, w, h);
+    for (let i = 0; i < 2600; i++){ const v = 120 + Math.random() * 70 | 0; x.fillStyle = `rgba(${v},${v},${v - 4},.35)`; x.fillRect(Math.random() * w, Math.random() * h, 1.5, 1.5); }
+  });
+}
+const CONC = concreteTex(); CONC.wrapS = CONC.wrapT = THREE.RepeatWrapping;
+
+/* ---------- матеріали ---------- */
+const M = {
+  body: new THREE.MeshStandardMaterial({color:0x0c0d0e, roughness:.72, metalness:.25}),
+  bodyIn: new THREE.MeshStandardMaterial({color:0x17181a, roughness:.6, metalness:.35, side:THREE.DoubleSide}),
+  housing: new THREE.MeshStandardMaterial({color:0x1d1f22, roughness:.55, metalness:.45}),
+  rim: new THREE.MeshStandardMaterial({color:0x0a0a0a, roughness:.35, metalness:.7}),
+  conc: new THREE.MeshStandardMaterial({map:CONC, color:0x8f918e, roughness:.95, metalness:0}),
+  concDark: new THREE.MeshStandardMaterial({map:CONC, color:0x6a6b68, roughness:.95}),
+  steel: new THREE.MeshStandardMaterial({color:0x6f757b, roughness:.45, metalness:.8}),
+  steelDark: new THREE.MeshStandardMaterial({color:0x3b3f44, roughness:.5, metalness:.7}),
+  white: new THREE.MeshStandardMaterial({color:0xb8b7b2, roughness:.6}),
+  cab: new THREE.MeshStandardMaterial({color:0x34433d, roughness:.5, metalness:.4}),
+};
+
+function stadium(w, h, r){
+  const s = new THREE.Shape(), x0 = -w / 2, y0 = -h / 2;
+  s.moveTo(x0 + r, y0); s.lineTo(x0 + w - r, y0); s.absarc(x0 + w - r, y0 + r, r, -Math.PI / 2, 0);
+  s.lineTo(x0 + w, y0 + h - r); s.absarc(x0 + w - r, y0 + h - r, r, 0, Math.PI / 2);
+  s.lineTo(x0 + r, y0 + h); s.absarc(x0 + r, y0 + h - r, r, Math.PI / 2, Math.PI);
+  s.lineTo(x0, y0 + r); s.absarc(x0 + r, y0 + r, r, Math.PI, Math.PI * 1.5);
+  return s;
+}
+function plateMesh(shape, depth, mat, bevel = .012){
+  const g = new THREE.ExtrudeGeometry(shape, {depth, bevelEnabled:true, bevelThickness:bevel, bevelSize:bevel, bevelSegments:3, curveSegments:32});
+  const m = new THREE.Mesh(g, mat); m.castShadow = m.receiveShadow = true; return m;
+}
+function mesh(g, m){ const o = new THREE.Mesh(g, m); o.castShadow = o.receiveShadow = true; return o; }
+
+/* лінза з оправою та козирком; z — площина передньої поверхні щита */
+function lamp(grp, x, y, z, r, c, lit, visor = true){
+  const ring = mesh(new THREE.TorusGeometry(r + .006, .012, 12, 48), M.rim); ring.position.set(x, y, z + .006); grp.add(ring);
+  const dome = new THREE.SphereGeometry(r, 48, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+  dome.rotateX(Math.PI / 2); dome.scale(1, 1, .18);
+  { const pp = dome.attributes.position, uv = dome.attributes.uv; for (let i = 0; i < pp.count; i++) uv.setXY(i, pp.getX(i) / (2 * r) + .5, pp.getY(i) / (2 * r) + .5); }
+  const mat = lit
+    ? new THREE.MeshBasicMaterial({map:lensTex(c, true), toneMapped:false})
+    : new THREE.MeshPhysicalMaterial({map:lensTex(c, false), roughness:.35, metalness:0, clearcoat:.6, clearcoatRoughness:.25});
+  const lens = new THREE.Mesh(dome, mat); lens.position.set(x, y, z); grp.add(lens);
+  if (lit){
+    const hc = c === 'x' ? 'y' : c;
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex(hc), blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, toneMapped:false, transparent:true}));
+    sp.scale.set(r * 5.4, r * 5.4, 1); sp.position.set(x, y, z + .03); sp.renderOrder = 10; grp.add(sp);
+    if (c === 'x'){ const sp2 = new THREE.Sprite(new THREE.SpriteMaterial({map:haloTex('r'), blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, toneMapped:false, transparent:true})); sp2.scale.set(r * 5, r * 5, 1); sp2.position.set(x, y - r * .4, z + .03); sp2.renderOrder = 10; grp.add(sp2); }
+  }
+  if (visor){
+    const len = r * 2.0;
+    const vg = new THREE.CylinderGeometry(r + .028, r + .028, len, 40, 1, true, -Math.PI * .62, Math.PI * 1.24);
+    vg.rotateX(Math.PI / 2);
+    /* косий зріз: нижні краї козирка коротші */
+    const p = vg.attributes.position;
+    for (let i = 0; i < p.count; i++){ const vy = p.getY(i) - 0, vz = p.getZ(i); if (vz > 0){ const k = (vy / (r + .028) + 1) / 2; p.setZ(i, -len / 2 + len * (.35 + .65 * k)); } }
+    vg.computeVertexNormals();
+    const v = mesh(vg, M.bodyIn); v.position.set(x, y, z + len / 2); grp.add(v);
+  }
+}
+
+function build(spec){
+  const grp = new THREE.Group();
+  const heads = spec.l.split('|').map(h => h.split(','));
+  const on = {}; (spec.on || '').split(',').forEach(s => { s = s.trim(); if (s) on[parseInt(s)] = /b$/.test(s) ? 'b' : 's'; });
+  const lit = i => on[i] && (on[i] === 's' || !spec.blinkOff);
+  const type = spec.type || 'mast', cab = type === 'cab', dwarf = type === 'dwarf';
+  const R = cab ? .075 : .107, STEP = cab ? .2 : .30, HW = cab ? .24 : .40, D = .06;
+  let stripAt = -1; if (spec.strip != null && spec.strip !== '') heads.forEach((h, i) => { if (h.length > 1) stripAt = i; });
+  let y = 0, idx = 0; const parts = [];
+  heads.forEach((h, hi) => {
+    if (h.length === 1 && spec.shape === 'diamond'){ const s = .30; parts.push({k:'dia', top:y, h:2 * s, n:h, i0:idx}); idx += 1; y -= 2 * s; }
+    else { const hh = cab ? h.length * STEP + .06 : (h.length - 1) * STEP + HW; parts.push({k:cab ? 'cab' : 'head', top:y, h:hh, n:h, i0:idx}); idx += h.length; y -= hh; }
+    if (hi === stripAt){ y -= .07; parts.push({k:'strip', top:y, h:.17}); y -= .17; }
+    if (spec.ind && hi === heads.length - 1){ y -= .04; parts.push({k:'ind', top:y, h:.46}); y -= .46; }
+    y -= .07;
+  });
+  const headsEnd = y + .07;
+  const zf = 0;          // передня площина щитів
+  const mastZ = -.42;
+
+  parts.forEach(p => {
+    const cy = p.top - p.h / 2;
+    if (p.k === 'head' || p.k === 'cab'){
+      if (p.k === 'head'){
+        const plate = plateMesh(stadium(HW, p.h, HW / 2), D, M.body); plate.position.set(0, cy, zf - D - .012); grp.add(plate);
+        /* корпуси ламп за щитом */
+        p.n.forEach((c, k) => { const ly = p.top - HW / 2 - k * STEP; const hs = mesh(new THREE.CylinderGeometry(.15, .15, .26, 32), M.housing); hs.rotateX(Math.PI / 2); hs.position.set(0, ly, zf - D - .14); grp.add(hs); });
+        p.n.forEach((c, k) => lamp(grp, 0, p.top - HW / 2 - k * STEP, zf, R, c, lit(p.i0 + k)));
+      } else {
+        const box = mesh(new THREE.BoxGeometry(HW + .06, p.h, .16), M.cab); box.position.set(0, cy, zf - .08); grp.add(box);
+        const face = plateMesh(stadium(HW, p.h - .04, .03), .01, M.body, .004); face.position.set(0, cy, zf - .006); grp.add(face);
+        p.n.forEach((c, k) => lamp(grp, 0, p.top - .03 - STEP / 2 - k * STEP, zf + .01, R, c, lit(p.i0 + k), false));
+      }
+      if (type === 'mast'){ const br = mesh(new THREE.BoxGeometry(.24, .08, .32), M.steelDark); br.position.set(0, cy, mastZ + .16); grp.add(br); }
+    }
+    if (p.k === 'dia'){
+      const s = new THREE.Shape(); const a = .30; s.moveTo(0, a); s.lineTo(a, 0); s.lineTo(0, -a); s.lineTo(-a, 0); s.lineTo(0, a);
+      const d = plateMesh(s, D, M.body, .01); d.position.set(0, cy, zf - D - .01); grp.add(d);
+      lamp(grp, 0, cy, zf, R, p.n[0], lit(p.i0));
+      if (type === 'mast'){ const br = mesh(new THREE.BoxGeometry(.24, .08, .32), M.steelDark); br.position.set(0, cy, mastZ + .16); grp.add(br); }
+    }
+    if (p.k === 'strip'){
+      const s = plateMesh(stadium(.62, p.h, .05), .05, M.body, .008); s.position.set(0, cy, zf - .05 - .008); grp.add(s);
+      [-.19, 0, .19].forEach(x => lamp(grp, x, cy, zf, .045, 'g', spec.strip !== '0' && !(spec.strip === 'b' && spec.blinkOff)));
+      if (type === 'mast'){ const br = mesh(new THREE.BoxGeometry(.2, .06, .2), M.steelDark); br.position.set(0, cy, mastZ + .08); grp.add(br); }
+    }
+    if (p.k === 'ind'){
+      const b = mesh(new THREE.BoxGeometry(.34, p.h, .14), M.body); b.position.set(0, cy, zf - .07); grp.add(b);
+      const litN = spec.ind === 'Н';
+      const t = canvasTex(170, 230, (x, w, h) => {
+        x.fillStyle = '#0c0c0d'; x.fillRect(0, 0, w, h);
+        for (let r = 0; r < 7; r++) for (let c = 0; c < 5; c++){ const on = litN && (c === 0 || c === 4 || r === 3); x.fillStyle = on ? '#ffffff' : '#2a2b2d'; x.beginPath(); x.arc(25 + c * 30, 25 + r * 30, 10, 0, 7); x.fill(); }
+      });
+      const f = new THREE.Mesh(new THREE.PlaneGeometry(.30, .42), new THREE.MeshStandardMaterial({map:t, emissiveMap:t, emissive:litN ? 0xffffff : 0x000000, emissiveIntensity:2, roughness:.4}));
+      f.position.set(0, cy, zf + .001); grp.add(f);
+      if (type === 'mast'){ const br = mesh(new THREE.BoxGeometry(.2, .06, .2), M.steelDark); br.position.set(0, cy, mastZ + .08); grp.add(br); }
+    }
+  });
+
+  /* ---------- щогла, драбина, табличка, фундамент ---------- */
+  const label = spec.label || '';
+  let rows = !label ? [] : (label.includes('|') ? label.split('|') : label.match(/^([^0-9]*)(.*)$/).slice(1).filter(Boolean));
+  let groundY;
+  if (type === 'mast'){
+    const plateTop = headsEnd - (spec.tsign ? .62 : .16);
+    const ph = rows.length * .17 + .06, pw = Math.max(.2, Math.max(...rows.map(r => r.length), 1) * .12 + .06);
+    groundY = Math.min(plateTop - ph - .9, headsEnd - 1.5);
+    const top = parts[0].top - (parts[0].k === 'dia' ? .30 : HW / 2);
+    const mh = top - groundY;
+    const mastMat = spec.stripe ? new THREE.MeshStandardMaterial({map:stripeTex.clone(), roughness:.7}) : M.conc;
+    if (spec.stripe){ mastMat.map.repeat.set(2, mh * 2.2); mastMat.map.needsUpdate = true; }
+    else { M.conc.map.repeat.set(1, mh); }
+    const mast = mesh(new THREE.CylinderGeometry(.085, .12, mh, 32), mastMat); mast.position.set(0, top - mh / 2, mastZ); grp.add(mast);
+    const cap = mesh(new THREE.SphereGeometry(.085, 24, 8, 0, Math.PI * 2, 0, Math.PI / 2), M.concDark); cap.position.set(0, top, mastZ); grp.add(cap);
+    /* драбина за щоглою */
+    const lz = mastZ - .2, lt = headsEnd - .05, lb = groundY + .25;
+    [-.19, .19].forEach(x => { const rl = mesh(new THREE.BoxGeometry(.035, lt - lb, .05), M.steel); rl.position.set(x, (lt + lb) / 2, lz); grp.add(rl); });
+    for (let ry = lb + .15; ry < lt; ry += .3){ const rg = mesh(new THREE.CylinderGeometry(.012, .012, .38, 8), M.steel); rg.rotateZ(Math.PI / 2); rg.position.set(0, ry, lz); grp.add(rg); }
+    [lb + .5, lt - .3].forEach(yy => { const st = mesh(new THREE.BoxGeometry(.03, .03, .2), M.steel); st.position.set(0, yy, lz + .1); grp.add(st); });
+    /* табличка */
+    if (rows.length){
+      const pl = new THREE.Mesh(new THREE.BoxGeometry(pw, ph, .012), [M.white, M.white, M.white, M.white, new THREE.MeshStandardMaterial({map:plateTex(rows, Math.round(pw * 400), Math.round(ph * 400)), color:0xc8c8c4, roughness:.6}), M.white]);
+      pl.castShadow = true; pl.position.set(0, plateTop - ph / 2, mastZ + .125); grp.add(pl);
+      [plateTop - .04, plateTop - ph + .04].forEach(yy => { const cl = mesh(new THREE.BoxGeometry(pw + .03, .025, .03), M.steelDark); cl.position.set(0, yy, mastZ + .11); grp.add(cl); });
+    }
+    /* щит «Т» */
+    if (spec.tsign){
+      const ty = headsEnd - .32;
+      const arm = mesh(new THREE.BoxGeometry(.42, .05, .05), M.steelDark); arm.position.set(.25, ty, mastZ + .02); grp.add(arm);
+      const s = new THREE.Shape(); const a = .22; s.moveTo(0, a); s.lineTo(a, 0); s.lineTo(0, -a); s.lineTo(-a, 0); s.lineTo(0, a);
+      const t = canvasTex(256, 256, (x, w) => { x.fillStyle = '#0d0d0e'; x.fillRect(0, 0, w, w);
+        x.strokeStyle = '#f0f0ea'; x.lineWidth = 14; x.beginPath(); x.moveTo(128, 14); x.lineTo(242, 128); x.lineTo(128, 242); x.lineTo(14, 128); x.closePath(); x.stroke();
+        x.fillStyle = '#f4f4f0'; [[-34, -22], [0, -22], [34, -22], [0, 12], [0, 46]].forEach(q => { x.beginPath(); x.arc(128 + q[0], 128 + q[1], 13, 0, 7); x.fill(); }); });
+      const g = new THREE.ShapeGeometry(s); const uv = g.attributes.uv; for (let i = 0; i < uv.count; i++) uv.setXY(i, (uv.getX(i) + a) / (2 * a), (uv.getY(i) + a) / (2 * a));
+      const d = plateMesh(s, .03, M.body, .006); d.position.set(.5, ty, mastZ + .04); grp.add(d);
+      const f = new THREE.Mesh(g, new THREE.MeshStandardMaterial({map:t, roughness:.5})); f.position.set(.5, ty, mastZ + .04 + .037); grp.add(f);
+    }
+    /* фундамент */
+    const fd = mesh(new THREE.BoxGeometry(.46, .3, .46), M.concDark); fd.position.set(0, groundY + .1, mastZ); grp.add(fd);
+  } else if (dwarf){
+    groundY = headsEnd - .5;
+    const s = new THREE.Shape(); s.moveTo(-.2, .5); s.lineTo(.2, .5); s.lineTo(.3, 0); s.lineTo(-.3, 0); s.lineTo(-.2, .5);
+    const base = plateMesh(s, .4, M.concDark, .01); base.position.set(0, groundY, -.45); grp.add(base);
+    if (label){
+      const lr = [label.replace('|', '')], pw = lr[0].length * .1 + .08;
+      const pl = new THREE.Mesh(new THREE.PlaneGeometry(pw, .14), new THREE.MeshStandardMaterial({map:plateTex(lr, Math.round(pw * 400), 56), color:0xc8c8c4, roughness:.6}));
+      pl.position.set(0, groundY + .2, -.045 + .015); pl.rotation.x = -Math.atan(.1 / .5); grp.add(pl);
+    }
+  }
+  /* недіючий: хрест */
+  if (spec.cross){
+    const h0 = parts[0].top + .05, h1 = headsEnd - .25, L = Math.hypot(.9, h0 - h1), ang = Math.atan2(h0 - h1, .9);
+    [ang, -ang].forEach(a => { const b = mesh(new THREE.BoxGeometry(L, .07, .025), M.white); b.rotation.z = a; b.position.set(0, (h0 + h1) / 2, zf + .16); grp.add(b); });
+  }
+  return {grp, groundY: groundY ?? headsEnd - .05, top: parts[0].top};
+}
+
+function render(spec){
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(BG);
+  scene.environment = envTex; scene.environmentIntensity = .3;
+  const {grp, groundY, top} = build(spec);
+  grp.rotation.y = THREE.MathUtils.degToRad(spec.type === 'cab' ? 0 : -16);
+  scene.add(grp);
+  scene.add(new THREE.HemisphereLight(0xbfd2ff, 0x2a2622, .45));
+  const sun = new THREE.DirectionalLight(0xfff3e0, 1.6); sun.position.set(-3, 5, 6); sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048); const sc = sun.shadow.camera; sc.left = -3; sc.right = 3; sc.top = 4; sc.bottom = -6; sc.near = .1; sc.far = 30; sun.shadow.bias = -.0004; sun.shadow.normalBias = .02;
+  scene.add(sun);
+  const rim = new THREE.DirectionalLight(0x9fb8ff, .8); rim.position.set(4, 2, -4); scene.add(rim);
+  if (spec.type !== 'cab'){
+    const gr = new THREE.Mesh(new THREE.CircleGeometry(1.1, 48), new THREE.ShadowMaterial({opacity:.45})); gr.rotation.x = -Math.PI / 2; gr.position.y = groundY - .05; gr.receiveShadow = true; scene.add(gr);
+    const gr2 = new THREE.Mesh(new THREE.CircleGeometry(.55, 48), new THREE.MeshBasicMaterial({color:0x000000, transparent:true, opacity:.25})); gr2.rotation.x = -Math.PI / 2; gr2.position.y = groundY - .049; scene.add(gr2);
+  }
+  /* кадр: ортографічна камера з постійним масштабом */
+  grp.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(grp);
+  const pad = .22;
+  const x0 = Math.min(box.min.x, -.45) - pad * .5, x1 = Math.max(box.max.x, .45) + pad * .5;
+  const y0 = (spec.type === 'cab' ? box.min.y : groundY - .14) - .04, y1 = box.max.y + pad;
+  const W = x1 - x0, H = y1 - y0;
+  const cam = new THREE.OrthographicCamera(x0, x1, y1, y0, .1, 50);
+  cam.position.set(0, 0, 10); cam.lookAt(0, 0, 0);
+  /* легкий погляд знизу */
+  const pw = Math.round(W * PXM), ph = Math.round(H * PXM);
+  renderer.setSize(pw, ph, false);
+  const comp = new EffectComposer(renderer);
+  comp.setSize(pw, ph);
+  comp.addPass(new RenderPass(scene, cam));
+  comp.addPass(new UnrealBloomPass(new THREE.Vector2(pw, ph), .35, .3, .98));
+  comp.addPass(new OutputPass());
+  comp.render();
+  const url = renderer.domElement.toDataURL('image/png');
+  comp.dispose();
+  scene.traverse(o => { if (o.geometry) o.geometry.dispose(); });
+  return {url, w:pw, h:ph};
+}
+window.renderSignal = render;
+window.ready = true;
+</script></body></html>
